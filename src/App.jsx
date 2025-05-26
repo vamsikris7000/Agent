@@ -3,7 +3,9 @@ import "./App.css";
 import { FiPhoneOff } from "react-icons/fi";
 import useVAD from "./useVAD";
 
-const WS_URL = "ws://localhost:8000/ws/audio";
+const WS_URL = process.env.NODE_ENV === 'production' 
+  ? 'wss://voiceagents.xpectrum-ai.com/ws/audio'
+  : 'ws://localhost:8000/ws/audio';
 
 const PHASE_LABELS = {
   greeting: "Agent is greeting...",
@@ -137,97 +139,104 @@ export default function App() {
 
   const connectWebSocket = () => {
     setConnectionStatus("connecting");
-    wsRef.current = new WebSocket(WS_URL);
+    try {
+      wsRef.current = new WebSocket(WS_URL);
 
-    wsRef.current.onopen = () => {
-      console.log("[WebSocket] Connection opened");
-      setConnectionStatus("connected");
-      wsRef.current.send(JSON.stringify({
-        type: "start",
-        message: "Hi, my name is Sandy, I am your car insurance agent. How can I help you?"
-      }));
-    };
+      wsRef.current.onopen = () => {
+        console.log("[WebSocket] Connection opened");
+        setConnectionStatus("connected");
+        wsRef.current.send(JSON.stringify({
+          type: "start",
+          message: "Hi, my name is Sandy, I am your car insurance agent. How can I help you?"
+        }));
+      };
 
-    wsRef.current.onmessage = async (event) => {
-      if (event.data instanceof Blob) {
-        // Handle binary audio data
-        const ab = await event.data.arrayBuffer();
-        console.log(`[WebSocket] Received audio chunk of size: ${ab.byteLength}`);
-        
-        try {
-          if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
-            audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
-          }
+      wsRef.current.onmessage = async (event) => {
+        if (event.data instanceof Blob) {
+          // Handle binary audio data
+          const ab = await event.data.arrayBuffer();
+          console.log(`[WebSocket] Received audio chunk of size: ${ab.byteLength}`);
           
-          audioContextRef.current.decodeAudioData(
-            ab,
-            (decodedBuffer) => {
-              console.log("Decoded WAV audio chunk successfully, duration:", decodedBuffer.duration);
-              enqueueDecodedChunk(decodedBuffer);
-            },
-            (error) => {
-              console.error("Failed to decode WAV audio chunk!", error);
-              const arr = new Uint8Array(ab);
-              console.error("First 16 bytes of buffer:", arr.slice(0, 16));
+          try {
+            if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
+              audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
             }
-          );
-        } catch (err) {
-          console.error("Error processing audio chunk:", err);
-        }
-      } else {
-        // Handle text/JSON messages
-        try {
-          const data = JSON.parse(event.data);
-          console.log(`[WebSocket] Received message: ${JSON.stringify(data)}`);
-          
-          if (data.type === "greeting") {
-            setMessages((msgs) => [...msgs, { role: "agent", text: data.text }]);
-            setPhase("greeting");
-            isGreeting.current = true;
-          } else if (data.type === "greeting_end") {
-            isGreeting.current = false;
-            setPhase("agent_speaking");
-          } else if (data.type === "transcript") {
-            setMessages((msgs) => [...msgs, { role: "user", text: data.text }]);
-            setPhase("agent_processing");
-          } else if (data.type === "response") {
-            setMessages((msgs) => [...msgs, { role: "agent", text: data.text }]);
-            setPhase("agent_speaking");
-          } else if (data.type === "agent_speaking") {
-            setPhase("agent_speaking");
-            setVadEnabled(false);
-          } else if (data.type === "agent_idle" || data.type === "user_speaking") {
-            setUserTurnActive(true);
-            setVadEnabled(true);
-          } else if (data.type === "interrupted") {
-            console.log("Agent interrupted by user.");
+            
+            audioContextRef.current.decodeAudioData(
+              ab,
+              (decodedBuffer) => {
+                console.log("Decoded WAV audio chunk successfully, duration:", decodedBuffer.duration);
+                enqueueDecodedChunk(decodedBuffer);
+              },
+              (error) => {
+                console.error("Failed to decode WAV audio chunk!", error);
+                const arr = new Uint8Array(ab);
+                console.error("First 16 bytes of buffer:", arr.slice(0, 16));
+              }
+            );
+          } catch (err) {
+            console.error("Error processing audio chunk:", err);
           }
-        } catch (error) {
-          console.error("Error parsing WebSocket message:", error);
+        } else {
+          // Handle text/JSON messages
+          try {
+            const data = JSON.parse(event.data);
+            console.log(`[WebSocket] Received message: ${JSON.stringify(data)}`);
+            
+            if (data.type === "greeting") {
+              setMessages((msgs) => [...msgs, { role: "agent", text: data.text }]);
+              setPhase("greeting");
+              isGreeting.current = true;
+            } else if (data.type === "greeting_end") {
+              isGreeting.current = false;
+              setPhase("agent_speaking");
+            } else if (data.type === "transcript") {
+              setMessages((msgs) => [...msgs, { role: "user", text: data.text }]);
+              setPhase("agent_processing");
+            } else if (data.type === "response") {
+              setMessages((msgs) => [...msgs, { role: "agent", text: data.text }]);
+              setPhase("agent_speaking");
+            } else if (data.type === "agent_speaking") {
+              setPhase("agent_speaking");
+              setVadEnabled(false);
+            } else if (data.type === "agent_idle" || data.type === "user_speaking") {
+              setUserTurnActive(true);
+              setVadEnabled(true);
+            } else if (data.type === "interrupted") {
+              console.log("Agent interrupted by user.");
+            }
+          } catch (error) {
+            console.error("Error parsing WebSocket message:", error);
+          }
         }
-      }
-    };
+      };
 
-    wsRef.current.onerror = (error) => {
-      console.log("[WebSocket] Connection error", error);
+      wsRef.current.onerror = (error) => {
+        console.log("[WebSocket] Connection error", error);
+        setConnectionStatus("disconnected");
+        setErrorMsg("Connection error. Attempting to reconnect...");
+        setPhase("error");
+      };
+
+      wsRef.current.onclose = (event) => {
+        console.log(`[WebSocket] Connection closed, code: ${event.code}`);
+        setConnectionStatus("disconnected");
+        if (phase !== "error" && isCallActive) {
+          setTimeout(() => {
+            connectWebSocket();
+          }, 1000);
+        }
+        if (event.code === 1006) {
+          console.log("WebSocket closed due to a connection error. Cleaning up session.");
+          handleEnd();
+        }
+      };
+    } catch (err) {
+      console.error("Error connecting to WebSocket:", err);
       setConnectionStatus("disconnected");
-      setErrorMsg("Connection error. Attempting to reconnect...");
+      setErrorMsg("Connection error. Please try again later.");
       setPhase("error");
-    };
-
-    wsRef.current.onclose = (event) => {
-      console.log(`[WebSocket] Connection closed, code: ${event.code}`);
-      setConnectionStatus("disconnected");
-      if (phase !== "error" && isCallActive) {
-        setTimeout(() => {
-          connectWebSocket();
-        }, 1000);
-      }
-      if (event.code === 1006) {
-        console.log("WebSocket closed due to a connection error. Cleaning up session.");
-        handleEnd();
-      }
-    };
+    }
   };
 
   // --- Recording logic ---
