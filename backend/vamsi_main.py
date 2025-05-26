@@ -40,7 +40,7 @@ CHATBOT_API_URL = os.getenv("CHATBOT_API_URL")
 NEXT_AGI_API_KEY = os.getenv("NEXT_AGI_API_KEY")
 
 # ElevenLabs API endpoints
-ELEVENLABS_API_URL = os.getenv("ELEVENLABS_API_URL")
+ELEVENLABS_API_URL = os.getenv("ELEVENLABS_API_URL", "https://api.elevenlabs.io/v1")
 TTS_ENDPOINT = f"{ELEVENLABS_API_URL}/text-to-speech/{ELEVENLABS_VOICE_ID}/stream"
 
 # Initialize OpenAI client
@@ -147,27 +147,45 @@ async def websocket_audio(websocket: WebSocket):
             try:
                 print("[Backend] Starting transcription...")
                 audio_bytes = b"".join(audio_chunks)
+                print(f"[Backend] Total audio size: {len(audio_bytes)} bytes")
+                
+                if len(audio_bytes) == 0:
+                    print("[Backend] Warning: No audio data to process")
+                    return
+                    
                 transcript = await transcribe_with_whisper(audio_bytes)
+                if not transcript:
+                    print("[Backend] Warning: Empty transcript received")
+                    return
+                    
                 print(f"[Backend] Transcription complete: {transcript}")
                 await safe_send_json(websocket, {"type": "transcript", "text": transcript})
+                
                 print("[Backend] Getting chatbot response...")
-                # Always use the session's conversation_id for context
                 response, new_conversation_id = await get_chatbot_response(
                     transcript,
                     {"conversation_id": sessions[session_id]["conversation_id"]},
                     websocket
                 )
+                
+                if not response:
+                    print("[Backend] Warning: No response from chatbot")
+                    return
+                    
                 print(f"[Backend] Chatbot response: {response}")
-                # Update conversation_id if a new one was returned
+                
                 if new_conversation_id and not sessions[session_id]["conversation_id"]:
                     sessions[session_id]["conversation_id"] = new_conversation_id
+                    
                 print("[Backend] Finished streaming TTS chunks.")
                 sessions[session_id]["state"] = "idle"
                 await safe_send_json(websocket, {"type": "agent_idle"})
                 await safe_send_json(websocket, {"type": "user_speaking"})
             except Exception as e:
-                print(f"[Backend] Error processing audio chunks (timeout): {e}")
-            audio_chunks.clear()
+                print(f"[Backend] Error processing audio chunks (timeout): {str(e)}")
+                await safe_send_json(websocket, {"type": "error", "message": "Failed to process audio"})
+            finally:
+                audio_chunks.clear()
 
     silence_timeout = 2.0  # seconds
     last_audio_time = None
@@ -261,10 +279,26 @@ async def safe_send_bytes(websocket, data):
 
 async def transcribe_with_whisper(audio_bytes):
     temp_path = f"/tmp/{uuid.uuid4()}.webm"
-    with open(temp_path, "wb") as f:
-        f.write(audio_bytes)
-    
     try:
+        # Ensure the /tmp directory exists
+        os.makedirs("/tmp", exist_ok=True)
+        
+        # Write the audio bytes to the temporary file
+        with open(temp_path, "wb") as f:
+            f.write(audio_bytes)
+        
+        # Verify the file exists and has content
+        if not os.path.exists(temp_path):
+            raise Exception("Failed to create temporary audio file")
+        
+        # Get file size
+        file_size = os.path.getsize(temp_path)
+        if file_size == 0:
+            raise Exception("Temporary audio file is empty")
+            
+        print(f"Processing audio file: {temp_path} (size: {file_size} bytes)")
+        
+        # Process the audio file
         with open(temp_path, "rb") as audio_file:
             transcript = client.audio.transcriptions.create(
                 model="whisper-1",
@@ -275,8 +309,13 @@ async def transcribe_with_whisper(audio_bytes):
         print(f"Error in transcription: {str(e)}")
         raise
     finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+        # Clean up the temporary file
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+                print(f"Cleaned up temporary file: {temp_path}")
+        except Exception as e:
+            print(f"Error cleaning up temporary file: {e}")
 
 async def get_chatbot_response(user_text, conversation_state=None, websocket=None):
     # Always use the provided conversation_id (do not update from chatbot response except for first response)
@@ -357,8 +396,7 @@ async def stream_elevenlabs_tts(text, websocket):
         headers = {
             "Accept": "audio/wav",
             "Content-Type": "application/json",
-            "xi-api-key":"sk_36686ad9136dcfccb467f2198754e0e513a57b922132c55e"
-
+            "xi-api-key": ELEVENLABS_API_KEY or "sk_36686ad9136dcfccb467f2198754e0e513a57b922132c55e"
         }
         data = {
             "text": text,
